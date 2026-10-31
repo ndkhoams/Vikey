@@ -23,6 +23,20 @@ If every listed change is intended, accept them with `Tools/autoswitch/check.sh 
 
 ---
 
+## 54. Output charset selection: Unicode / TCVN3 / VNI (Windows)
+
+**Status:** Agreed, implemented 2026-10-31, not yet built. (Decision 10 "fewer features" removed the code tables; this brings back Unicode/TCVN3/VNI only, not Unicode Compound or CP1258.)
+
+**User story.** As a user, I want a "Bảng mã" dropdown like Unikey's, so I can type into apps that need TCVN3 (ABC) or VNI Windows fonts.
+
+**Decision.** A "Bảng mã" row at the top of the Settings window's "Gõ tiếng Việt" group: Unicode (default), TCVN3 (ABC), VNI Windows. The engine still composes Unicode; each composed character is converted just before it is sent (`Windows/App/Charset.cpp`, pref `Charset`).
+
+**Tables.** Generated (`Tools/gen_charset_table.py`) from OpenKey's `_codeTable` and cross-checked entry-by-entry (134/134) against Unikey's own `SingleByteTables`/`DoubleByteTables` in fcitx5-unikey. TCVN3 is 1 byte per character (tone+plain-vowel case follows Unikey: Á and á share a byte); VNI is 1 byte, or 2 (base character, then the mark) for vowels with a hat/breve/horn or a tone.
+
+**Backspaces.** Deleting a character must delete its output units, not its logical characters. VNI mode keeps a per-word unit count per sent character (OpenKey's `_syncKey` design): cleared on word break/click/app switch, pushed for every sent character (including keys the engine leaves alone), popped with an extra backspace when a 2-unit character is deleted — both for engine-driven deletes and for a Backspace the engine passes through. TCVN3 and Unicode are 1:1 and need no tracking. Verified end-to-end against the real engine on Linux (`/tmp/engtest/e2e.cpp` scratch): TCVN3 and VNI byte streams, tone-undo, and both backspace paths.
+
+**Also:** OpenKey migrants keep their table (`vCodeTable` 0–2 migrates to `Charset`; 3/4 are not brought back). Per-app charset memory (removed in decision 10) is not brought back.
+
 ## 53. Teencode spelling (engine, off by default)
 
 **Status:** In the engine 2026-10-31, **on by default** (Tony: "ok, on by default"); an app setting comes with the main window revamp. Rules D53 (9 cases).

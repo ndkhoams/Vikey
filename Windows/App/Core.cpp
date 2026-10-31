@@ -2,6 +2,7 @@
 #include "Site.h"
 #include "KeyMap.h"
 #include "Prefs.h"
+#include "Charset.h"
 #include "Engine.h"
 #include <psapi.h>
 #include <mmsystem.h>
@@ -25,6 +26,47 @@ static volatile bool vEmojiOpen = false;
 static HWND vEmojiWindow = nullptr;
 
 namespace vikey { namespace core {
+
+// ---- Output charset (Unicode / TCVN3 / VNI) ------------------------------------------------
+// The engine always composes Unicode; each composed character is converted to the target
+// charset just before it is sent (Unikey's "Bảng mã"). TCVN3 and Unicode are 1 output unit
+// per character; VNI Windows is 1 or 2 (base character, then the mark), so the number of
+// backspaces needed to delete a character depends on the character itself.
+//
+// _units tracks, for the current word, how many output units each sent logical character
+// produced (VNI mode only; the other charsets are 1:1). It mirrors OpenKey's _syncKey:
+// cleared when the word ends, pushed for every character sent, popped (with the extra
+// backspace) when characters are deleted.
+static int vCharset = 0;
+static std::vector<unsigned char> _units;
+static charset::Charset curCharset() { return (charset::Charset)vCharset; }
+static bool trackUnits() { return vCharset == (int)charset::Charset::Vni; }
+static void unitsReset() { _units.clear(); }
+static void unitsPush(wchar_t ch) {
+    if (!trackUnits()) return;
+    if (_units.size() >= 128) _units.erase(_units.begin());   // stale prefix entries are never popped (deletes are always a suffix)
+    _units.push_back((unsigned char)charset::unitCount(ch, curCharset()));
+}
+/// Pops n logical characters and returns how many output units they occupied.
+/// Unknown characters (tracker empty, e.g. after a cursor move) count as 1.
+static int unitsPop(int n) {
+    if (!trackUnits()) return n;
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        if (_units.empty()) { total += 1; continue; }
+        total += _units.back(); _units.pop_back();
+    }
+    return total;
+}
+/// The user pressed Backspace and the engine left it alone: the key goes to the app and
+/// deletes one unit there. Returns true when one more backspace must be sent because the
+/// last logical character occupied two units (VNI).
+static bool unitsNoteUserBackspace() {
+    if (!trackUnits() || _units.empty()) return false;
+    bool extra = _units.back() > 1;
+    _units.pop_back();
+    return extra;
+}
 
 /// The switch sound (Tony picked "sparkle", 2026-10-29): two tiny notes, rising into Vietnamese, falling into
 /// English. The same WAVs as the Mac's .caf files, embedded in Vikey.exe (Vikey.rc).
@@ -236,6 +278,7 @@ void onForegroundChanged() {
     TLEndWord("app"); _tlApp = _frontApp;
     if (vUseSmartSwitchKey) ApplySmartSwitch();
     startNewSession();
+    unitsReset();
 }
 void onSiteChanged(const std::wstring& host) {
     if (host == _siteHost) return;
@@ -243,6 +286,7 @@ void onSiteChanged(const std::wstring& host) {
     ResetEnglishWord(true); _autoFixUndo.active = false;
     if (vUseSmartSwitchKey) ApplySmartSwitch();
     startNewSession();
+    unitsReset();
 }
 
 // ---- Other input language (Japanese, Chinese...) ------------------------------------------
@@ -280,6 +324,9 @@ void reloadSettings() {
     int hotkey = prefs::getInt(L"SwitchKeyStatus", 0);
     vSwitchKeyStatus = hotkey ? hotkey : 0x7A000206;   // default Alt+Z (same bits as ⌥Z on macOS)
     vEmojiHotkey = prefs::getInt(L"EmojiPicker", 0) ? prefs::getInt(L"EmojiHotkey", 0) : 0;
+    int cs = prefs::getInt(L"Charset", 0);
+    vCharset = (cs >= 0 && cs <= 2) ? cs : 0;
+    unitsReset();   // the unit counts only make sense for one charset at a time
     updateOtherInputLanguage();
     if (_observer) _observer(vLanguage);
 }
@@ -301,18 +348,30 @@ static void batchKey(WORD vk, bool shift) {
     if (shift) { inputKey(b, VK_SHIFT, false); _batch.push_back(b); }
 }
 static void flushBatch() { if (!_batch.empty()) { SendInput((UINT)_batch.size(), _batch.data(), sizeof(INPUT)); _batch.clear(); } }
+static void sendExtraBackspace() {
+    INPUT bs[2]; inputKey(bs[0], VK_BACK, true); inputKey(bs[1], VK_BACK, false);
+    SendInput(2, bs, sizeof(INPUT));   // tagged with VIKEY_EVENT_TAG, so the hook lets it through
+}
 
 /// Types the engine's new characters; for a restore, also the key that triggered it.
+/// Each composed (Unicode) character is converted to the output charset here.
 static void batchEngineChars() {
-    wchar_t text[MAX_BUFF + 2]; int n = 0;
-    for (int k = pData->newCharCount - 1; k >= 0 && n < MAX_BUFF; k--) {
+    const charset::Charset cs = curCharset();
+    wchar_t text[(MAX_BUFF + 2) * 2]; int n = 0, nc = 0;
+    const int cap = (int)(sizeof(text) / sizeof(text[0]));
+    auto pushChar = [&](wchar_t ch) {
+        wchar_t out[2]; int m = charset::convert(ch, cs, out);
+        for (int i = 0; i < m && n < cap; i++) text[n++] = out[i];
+        unitsPush(ch);
+    };
+    for (int k = pData->newCharCount - 1; k >= 0 && nc < MAX_BUFF; k--, nc++) {
         Uint32 c = pData->charData[k];
-        text[n++] = (c & CHAR_CODE_MASK) ? (wchar_t)(c & 0xFFFF) : (wchar_t)keyCodeToCharacter(c);
+        pushChar((c & CHAR_CODE_MASK) ? (wchar_t)(c & 0xFFFF) : (wchar_t)keyCodeToCharacter(c));
     }
     bool sendControlKey = false;
     if (pData->code == vRestore || pData->code == vRestoreAndStartNewSession) {
         Uint16 ch = keyCodeToCharacter(_keycode | ((_flag & F_CAPS) || (_flag & F_SHIFT) ? CAPS_MASK : 0));
-        if (ch != 0) text[n++] = (wchar_t)ch; else sendControlKey = true;
+        if (ch != 0) pushChar((wchar_t)ch); else sendControlKey = true;
     }
     if (pData->code == vRestoreAndStartNewSession) startNewSession();
     if (n > 0) batchText(text, n);
@@ -322,8 +381,8 @@ static void batchEngineChars() {
 /// Sends the engine's result for the current key: backspaces, then the new characters.
 static void SendEngineOutput() {
     // defeats address-bar autocomplete; not when the extra backspace would reach MAX_BUFF (the engine can ask for 31): then none would be sent
-    if (vFixRecommendBrowser && pData->extCode != 4 && pData->backspaceCount < MAX_BUFF - 1) { wchar_t e = 0x202F; batchText(&e, 1); pData->backspaceCount++; }
-    if (pData->backspaceCount > 0 && pData->backspaceCount < MAX_BUFF) batchBackspaces(pData->backspaceCount);
+    if (vFixRecommendBrowser && pData->extCode != 4 && pData->backspaceCount < MAX_BUFF - 1) { wchar_t e = 0x202F; batchText(&e, 1); unitsPush(e); pData->backspaceCount++; }
+    if (pData->backspaceCount > 0 && pData->backspaceCount < MAX_BUFF) batchBackspaces(unitsPop(pData->backspaceCount));
     batchEngineChars();
     flushBatch();
 }
@@ -364,10 +423,11 @@ void setLanguageObserver(std::function<void(int)> f) { _observer = f; }
 static std::function<void()> _emojiHandler;
 void setEmojiHotkeyHandler(std::function<void()> f) { _emojiHandler = f; }
 void setEmojiPickerOpen(bool open, HWND picker) { vEmojiWindow = picker; vEmojiOpen = open; }
-void resetTyping() { ResetEnglishWord(true); _autoFixUndo.active = false; startNewSession(); }
+void resetTyping() { ResetEnglishWord(true); _autoFixUndo.active = false; startNewSession(); unitsReset(); }
 void insertText(const std::wstring& text) {
     resetTyping();
     batchText(text.c_str(), (int)text.size());   // KEYEVENTF_UNICODE per UTF-16 unit: surrogate pairs arrive as one character
+    for (wchar_t ch : text) unitsPush(ch);
     flushBatch();
 }
 
@@ -397,9 +457,10 @@ static bool UndoAutoFixWithBackspace() {
     if (!_autoFixUndo.active) return false;
     _autoFixUndo.active = false;
     int removeCount = _autoFixUndo.removeCount;
-    if (vFixRecommendBrowser) { wchar_t e = 0x202F; batchText(&e, 1); removeCount++; }
-    batchBackspaces(removeCount);
+    if (vFixRecommendBrowser) { wchar_t e = 0x202F; batchText(&e, 1); unitsPush(e); removeCount++; }
+    batchBackspaces(unitsPop(removeCount));
     batchText(_autoFixUndo.text, _autoFixUndo.textCount);
+    for (int i = 0; i < _autoFixUndo.textCount; i++) unitsPush(_autoFixUndo.text[i]);
     flushBatch();
     TLUndo();
     if (vLanguage != _autoFixUndo.language) { vLanguage = _autoFixUndo.language; VKLanguageChanged(true); }
@@ -568,7 +629,17 @@ static LRESULT CALLBACK keyboardHook(int nCode, WPARAM wParam, LPARAM lParam) {
     vAutoSwitchRequest = -1;
     vKeyHandleEvent(vKeyEvent::Keyboard, vKeyEventState::KeyDown, _keycode,
                     (_flag & F_SHIFT) ? 1 : ((_flag & F_CAPS) ? 2 : 0), OTHER_CONTROL_KEY);
-    if (pData->code == vDoNothing) return CallNextHookEx(_kbHook, nCode, wParam, lParam);
+    if (pData->code == vDoNothing) {
+        // the key goes to the app untouched: keep the unit tracker in sync (VNI mode)
+        if (pData->extCode == 1) unitsReset();                 // word break, or the cursor moved away
+        else if (pData->extCode == 2) {                        // Backspace: the app deletes one unit;
+            if (unitsNoteUserBackspace()) sendExtraBackspace(); // a 2-unit character needs one more
+        } else if (pData->extCode == 3) {                      // a plain character went through
+            Uint16 ch = keyCodeToCharacter(_keycode | ((_flag & F_CAPS) || (_flag & F_SHIFT) ? CAPS_MASK : 0));
+            if (ch != 0) unitsPush((wchar_t)ch);
+        }
+        return CallNextHookEx(_kbHook, nCode, wParam, lParam);
+    }
     if (pData->code == vWillProcess || pData->code == vRestore || pData->code == vRestoreAndStartNewSession) {
         bool autoSwitchAtBreak = vAutoSwitchRequest == 0 && !IsLetterKey(_keycode);
         int correctedCount = pData->newCharCount;
@@ -585,6 +656,7 @@ static LRESULT CALLBACK mouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
             if (!PtInRect(&r, p)) PostMessageW(vEmojiWindow, WM_APP + 11, 0, 0);
         }
         _autoFixUndo.active = false; TLNoteClick();
+        unitsReset();   // the click starts a new word elsewhere
         if (vLanguage == 0) ResetEnglishWord(true);
         else vKeyHandleEvent(vKeyEvent::Mouse, vKeyEventState::MouseDown, 0);
     }
