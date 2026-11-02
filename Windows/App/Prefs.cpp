@@ -111,7 +111,10 @@ void migrateFromOpenKey() {
         DWORD v = 0, size = sizeof(v), type = 0;
         if (RegQueryValueExW(h, m.from, nullptr, &type, (LPBYTE)&v, &size) == ERROR_SUCCESS && type == REG_DWORD && !has(m.to)) setInt(m.to, (int)v);
     }
-    DWORD size = 0, type = 0;
+    DWORD v = 0, size = sizeof(v), type = 0;
+    // OpenKey's vCodeTable: 0 Unicode, 1 TCVN3, 2 VNI (3 Unicode Compound and 4 CP1258 are not brought back)
+    if (RegQueryValueExW(h, L"vCodeTable", nullptr, &type, (LPBYTE)&v, &size) == ERROR_SUCCESS && type == REG_DWORD && !has(L"Charset") && v <= 2) setInt(L"Charset", (int)v);
+    size = 0, type = 0;
     if (RegQueryValueExW(h, L"smartSwitchKey", nullptr, &type, nullptr, &size) == ERROR_SUCCESS && size > 0 && !has(L"smartSwitchKey")) {
         std::vector<BYTE> d(size);
         if (RegQueryValueExW(h, L"smartSwitchKey", nullptr, &type, d.data(), &size) == ERROR_SUCCESS) setBinary(L"smartSwitchKey", d.data(), size);
